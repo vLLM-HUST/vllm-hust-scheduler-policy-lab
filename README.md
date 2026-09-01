@@ -2,7 +2,7 @@
 
 Owner-led research carrier for runtime transitions, scheduler baseline ports, and structured-output effectiveness telemetry. It is a comparison workspace, not one deployable plugin.
 
-**Status: source-preservation and contract-design scaffold. There is no installable runtime implementation or support claim yet.**
+**Status: host-independent policy code is installable and tested; vLLM runtime activation remains blocked until the host contracts in `HOST_CONTRACT.md` exist.**
 
 Technical ownership belongs to @Tkhkrnx. Source extraction must preserve exact authorship, license, tests, constraints, and evidence before activation is considered.
 
@@ -13,9 +13,9 @@ See [MAINTAINERS.md](MAINTAINERS.md) and [PROVENANCE.md](PROVENANCE.md).
 Extension ID: `org.vllm-hust.scheduler-policy-lab`
 
 This repository follows the vLLM-HUST Extension Template. The current package
-is deliberately `import_only`: it can be built, installed, discovered, and
-inspected, but Extension Manager must refuse enablement until the maintainers
-land a real host contract, implementation, compatibility evidence, and tests.
+is deliberately `import_only`: Past-Future, Sarathi, and recapture-observer
+components can be imported and tested, but Extension Manager must refuse
+enablement until the scheduler host contracts and compatibility evidence land.
 
 ```bash
 python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"

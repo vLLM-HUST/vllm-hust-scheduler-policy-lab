@@ -5,11 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "vllm-hust-scheduler-policy-lab"
 version = "0.1.0.dev0"
-description = "vllm-hust-scheduler-policy-lab inert vLLM-HUST contract descriptor"
+description = "Extracted scheduler research policies for vLLM-HUST"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-dependencies = []
+dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
