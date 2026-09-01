@@ -1,0 +1,252 @@
+From 5fb9651c50e03019abd48df441219e9c0f25ab35 Mon Sep 17 00:00:00 2001
+From: Pharos Peng <q1293132751@163.com>
+Date: Thu, 27 Aug 2026 00:55:11 +0800
+Subject: [PATCH] Add bounded structured-output effectiveness telemetry
+
+---
+ vllm/v1/structured_output/__init__.py | 97 ++++++++++++++++++++++++++-
+ vllm/v1/structured_output/utils.py    | 68 +++++++++++++++++++
+ 2 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 213b49f28..dc176f4d0 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -1,7 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import hashlib
+ import itertools
++import json
+ import multiprocessing
++import os
++import time
++from collections import deque
+ from collections.abc import Iterable
+ from concurrent.futures import Future, ThreadPoolExecutor
+ from typing import TYPE_CHECKING
+@@ -30,6 +35,41 @@ else:
+ 
+ 
+ logger = init_logger(__name__)
++_QBI_SCHEMA_RECEIPT_WINDOW = max(int(os.getenv("QBI_SCHEMA_RECEIPT_WINDOW", "8192")), 1)
++
++
++def _remember_qbi_request(
++    request_id: str,
++    seen: set[str],
++    order: deque[str],
++) -> bool:
++    if request_id in seen:
++        return False
++    seen.add(request_id)
++    order.append(request_id)
++    if len(order) > _QBI_SCHEMA_RECEIPT_WINDOW:
++        seen.remove(order.popleft())
++    return True
++
++
++def _emit_qbi_schema_event(phase: str, request_id: str, **fields: object) -> None:
++    receipt_path = os.getenv("QBI_SCHEMA_EFFECTIVE_EVENT_LOG")
++    if not receipt_path:
++        return
++    event = {
++        "schema": "qbi.schema-effective-event.v1",
++        "phase": phase,
++        "request_id": request_id,
++        "pid": os.getpid(),
++        "time_ns": time.time_ns(),
++        **fields,
++    }
++    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
++    fd = os.open(receipt_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
++    try:
++        os.write(fd, payload)
++    finally:
++        os.close(fd)
+ 
+ 
+ class StructuredOutputManager:
+@@ -39,6 +79,13 @@ class StructuredOutputManager:
+         self.backend: StructuredOutputBackend | None = None
+         self.reasoner: ReasoningParser | None = None
+         self.vllm_config = vllm_config
++        # Receipt-only telemetry for mechanism admission.  These sets bound
++        # logging to one event per request while keeping the normal structured
++        # output execution path unchanged.
++        self._qbi_compiled_request_ids: set[str] = set()
++        self._qbi_bitmask_filled_request_ids: set[str] = set()
++        self._qbi_compiled_request_order: deque[str] = deque()
++        self._qbi_bitmask_filled_request_order: deque[str] = deque()
+ 
+         # When in external_launcher mode, async grammar compilation causes deadlocks
+         # due to external_launcher mode having a scheduler for each TP rank.
+@@ -163,7 +210,31 @@ class StructuredOutputManager:
+         request_type, grammar_spec = key
+ 
+         assert self.backend is not None
+-        return self.backend.compile_grammar(request_type, grammar_spec)
++        grammar = self.backend.compile_grammar(request_type, grammar_spec)
++        if _remember_qbi_request(
++            request.request_id,
++            self._qbi_compiled_request_ids,
++            self._qbi_compiled_request_order,
++        ):
++            key_sha256 = hashlib.sha256(
++                f"{request_type}\0{grammar_spec}".encode()
++            ).hexdigest()
++            logger.info(
++                "QBI_SCHEMA_EVENT phase=grammar_compiled request_id=%s "
++                "backend=%s request_type=%s key_sha256=%s",
++                request.request_id,
++                type(self.backend).__name__,
++                request_type,
++                key_sha256,
++            )
++            _emit_qbi_schema_event(
++                "grammar_compiled",
++                request.request_id,
++                backend=type(self.backend).__name__,
++                request_type=str(request_type),
++                key_sha256=key_sha256,
++            )
++        return grammar
+ 
+     def _fill_bitmasks(
+         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
+@@ -276,6 +347,30 @@ class StructuredOutputManager:
+         if cumulative_index < bitmask_tensor.shape[0]:
+             bitmask_tensor = bitmask_tensor[:cumulative_index]
+ 
++        for req_id in structured_output_request_ids:
++            if _remember_qbi_request(
++                req_id,
++                self._qbi_bitmask_filled_request_ids,
++                self._qbi_bitmask_filled_request_order,
++            ):
++                logger.info(
++                    "QBI_SCHEMA_EVENT phase=bitmask_filled request_id=%s "
++                    "backend=%s rows=%s",
++                    req_id,
++                    type(self.backend).__name__ if self.backend is not None else "none",
++                    cumulative_index,
++                )
++                _emit_qbi_schema_event(
++                    "bitmask_filled",
++                    req_id,
++                    backend=(
++                        type(self.backend).__name__
++                        if self.backend is not None
++                        else "none"
++                    ),
++                    rows=cumulative_index,
++                )
++
+         # After finishing with the xgrammar operations, we convert to
+         # np.ndarray, because that is much more efficient for serialization
+         # and deserialization when sending this to the GPU workers.
+diff --git a/vllm/v1/structured_output/utils.py b/vllm/v1/structured_output/utils.py
+index f149ae845..b8d3bfc4e 100644
+--- a/vllm/v1/structured_output/utils.py
++++ b/vllm/v1/structured_output/utils.py
+@@ -4,8 +4,11 @@ from __future__ import annotations
+ 
+ import hashlib
+ import importlib.metadata
++import json
+ import os
+ import tempfile
++import time
++from collections import deque
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -39,6 +42,43 @@ else:
+ logger = init_logger(__name__)
+ 
+ CACHE = None
++_QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS: set[str] = set()
++_QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER: deque[str] = deque()
++_QBI_SCHEMA_RECEIPT_WINDOW = max(int(os.getenv("QBI_SCHEMA_RECEIPT_WINDOW", "8192")), 1)
++
++
++def _remember_qbi_mask_request(request_id: str) -> bool:
++    if request_id in _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS:
++        return False
++    _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS.add(request_id)
++    _QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER.append(request_id)
++    if len(_QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER) > _QBI_SCHEMA_RECEIPT_WINDOW:
++        expired = _QBI_SCHEMA_MASK_APPLIED_REQUEST_ORDER.popleft()
++        _QBI_SCHEMA_MASK_APPLIED_REQUEST_IDS.remove(expired)
++    return True
++
++
++def _emit_qbi_schema_mask_applied(
++    request_id: str, *, logit_rows: int, constrained_rows: int
++) -> None:
++    receipt_path = os.getenv("QBI_SCHEMA_EFFECTIVE_EVENT_LOG")
++    if not receipt_path:
++        return
++    event = {
++        "schema": "qbi.schema-effective-event.v1",
++        "phase": "mask_applied",
++        "request_id": request_id,
++        "pid": os.getpid(),
++        "time_ns": time.time_ns(),
++        "logit_rows": logit_rows,
++        "constrained_rows": constrained_rows,
++    }
++    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
++    fd = os.open(receipt_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
++    try:
++        os.write(fd, payload)
++    finally:
++        os.close(fd)
+ 
+ 
+ def apply_grammar_bitmask(
+@@ -119,6 +159,20 @@ def apply_grammar_bitmask(
+             index_tensor = index_tensor.to(logits.device, non_blocking=True)
+ 
+         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
++        for req_id in grammar_output.structured_output_request_ids:
++            if _remember_qbi_mask_request(req_id):
++                logger.info(
++                    "QBI_SCHEMA_EVENT phase=mask_applied request_id=%s "
++                    "logit_rows=%s constrained_rows=%s",
++                    req_id,
++                    logits.shape[0],
++                    len(out_indices),
++                )
++                _emit_qbi_schema_mask_applied(
++                    req_id,
++                    logit_rows=logits.shape[0],
++                    constrained_rows=len(out_indices),
++                )
+         return
+ 
+     # CPU case, use list for indices.
+@@ -133,6 +187,20 @@ def apply_grammar_bitmask(
+         logits.copy_(logits_fp32.to(logits.dtype))
+     else:
+         xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=indices)
++    for req_id in grammar_output.structured_output_request_ids:
++        if _remember_qbi_mask_request(req_id):
++            logger.info(
++                "QBI_SCHEMA_EVENT phase=mask_applied request_id=%s "
++                "logit_rows=%s constrained_rows=%s",
++                req_id,
++                logits.shape[0],
++                len(out_indices),
++            )
++            _emit_qbi_schema_mask_applied(
++                req_id,
++                logit_rows=logits.shape[0],
++                constrained_rows=len(out_indices),
++            )
+ 
+ 
+ class OutlinesVocabulary:
+-- 
+2.53.0.windows.3
+

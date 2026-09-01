@@ -1,0 +1,328 @@
+From 2dca1b0956ba7f89cad4afa280f0eaf3386905b3 Mon Sep 17 00:00:00 2001
+From: Pharos Peng <q1293132751@163.com>
+Date: Thu, 27 Aug 2026 00:37:35 +0800
+Subject: [PATCH] Add bounded native recapture scheduler observer
+
+---
+ .../v1/core/test_runtime_scheduler_limits.py  |  49 +++++++
+ vllm/entrypoints/serve/rpc/api_router.py      |  25 ++++
+ .../core/sched/native_recapture_observer.py   | 120 ++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               |  25 ++++
+ vllm/v1/engine/core.py                        |  12 ++
+ 5 files changed, 231 insertions(+)
+ create mode 100644 vllm/v1/core/sched/native_recapture_observer.py
+
+diff --git a/tests/v1/core/test_runtime_scheduler_limits.py b/tests/v1/core/test_runtime_scheduler_limits.py
+index 01909e321..a59dada95 100644
+--- a/tests/v1/core/test_runtime_scheduler_limits.py
++++ b/tests/v1/core/test_runtime_scheduler_limits.py
+@@ -1,10 +1,14 @@
+ from __future__ import annotations
+ 
+ from collections import deque
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+ from vllm.v1.core.sched.interface import PauseState
++from vllm.v1.core.sched.native_recapture_observer import (
++    NativeRecaptureScopeObserver,
++)
+ from vllm.v1.core.sched.scheduler import Scheduler
+ 
+ 
+@@ -24,9 +28,54 @@ def _scheduler() -> Scheduler:
+     scheduler.num_waiting_for_streaming_input = 0
+     scheduler.requests = {}
+     scheduler.log_stats = False
++    scheduler._native_recapture_scope_observer = NativeRecaptureScopeObserver(
++        enabled=True,
++        capacity=128,
++        request_prefix="chatcmpl-anise-native-recapture-",
++    )
+     return scheduler
+ 
+ 
++def test_native_recapture_observer_records_exact_formed_batch_membership() -> None:
++    scheduler = _scheduler()
++    output = SimpleNamespace(
++        num_scheduled_tokens={
++            "chatcmpl-anise-native-recapture-a": 32,
++            "chatcmpl-anise-native-recapture-b": 48,
++            "chatcmpl-unrelated": 16,
++        },
++        total_num_scheduled_tokens=96,
++    )
++
++    scheduler._record_native_recapture_scope(output)
++    state = scheduler.get_native_recapture_scope_state()
++
++    assert state["latest_sequence"] == 1
++    assert len(state["receipts"]) == 1
++    receipt = state["receipts"][0]
++    assert receipt["formed_batch"] is True
++    assert receipt["matched_request_count"] == 2
++    assert receipt["request_count"] == 3
++    assert receipt["request_ids"] == [
++        "chatcmpl-anise-native-recapture-a",
++        "chatcmpl-anise-native-recapture-b",
++        "chatcmpl-unrelated",
++    ]
++    assert scheduler.get_native_recapture_scope_state(1)["receipts"] == []
++
++
++def test_native_recapture_observer_ignores_unbound_requests() -> None:
++    scheduler = _scheduler()
++    output = SimpleNamespace(
++        num_scheduled_tokens={"chatcmpl-unrelated": 16},
++        total_num_scheduled_tokens=16,
++    )
++
++    scheduler._record_native_recapture_scope(output)
++
++    assert scheduler.get_native_recapture_scope_state()["receipts"] == []
++
++
+ def test_runtime_scheduler_limits_commit_and_rollback_without_restart() -> None:
+     scheduler = _scheduler()
+     prepared = scheduler.prepare_runtime_scheduler_limits(2048, 8)
+diff --git a/vllm/entrypoints/serve/rpc/api_router.py b/vllm/entrypoints/serve/rpc/api_router.py
+index 54f582c40..3d64933be 100644
+--- a/vllm/entrypoints/serve/rpc/api_router.py
++++ b/vllm/entrypoints/serve/rpc/api_router.py
+@@ -55,6 +55,31 @@ async def collective_rpc(raw_request: Request):
+     return JSONResponse(content={"results": response})
+ 
+ 
++@router.get("/qbi/native-recapture/scope")
++async def native_recapture_scope(raw_request: Request, after_sequence: int = 0):
++    """Read prompt-free scheduler receipts from the isolated control surface."""
++
++    utility = getattr(engine_client(raw_request), "call_utility_async", None)
++    if not callable(utility):
++        raise HTTPException(
++            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
++            detail="Engine client does not expose utility calls",
++        )
++    try:
++        result = await utility("get_native_recapture_scope_state", after_sequence)
++    except (TypeError, ValueError) as error:
++        raise HTTPException(
++            status_code=HTTPStatus.BAD_REQUEST.value,
++            detail=str(error),
++        ) from error
++    if not isinstance(result, dict):
++        raise HTTPException(
++            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
++            detail="Engine returned a non-object native recapture state",
++        )
++    return JSONResponse(content=result)
++
++
+ def attach_router(app: FastAPI):
+     if not envs.VLLM_SERVER_DEV_MODE:
+         return
+diff --git a/vllm/v1/core/sched/native_recapture_observer.py b/vllm/v1/core/sched/native_recapture_observer.py
+new file mode 100644
+index 000000000..997dbb914
+--- /dev/null
++++ b/vllm/v1/core/sched/native_recapture_observer.py
+@@ -0,0 +1,120 @@
++"""Bounded prompt-free scheduler evidence for ANISE native recapture."""
++
++from __future__ import annotations
++
++import os
++import time
++from collections import deque
++from collections.abc import Mapping
++from typing import Any
++
++
++class NativeRecaptureScopeObserver:
++    """Retain only scheduling steps joined to formal recapture request IDs."""
++
++    def __init__(self, *, enabled: bool, capacity: int, request_prefix: str) -> None:
++        if not isinstance(enabled, bool):
++            raise ValueError("native recapture observer enabled must be boolean")
++        if isinstance(capacity, bool) or not isinstance(capacity, int):
++            raise ValueError("native recapture observer capacity must be an integer")
++        if not 128 <= capacity <= 65536:
++            raise ValueError(
++                "native recapture observer capacity must be in [128, 65536]"
++            )
++        normalized_prefix = str(request_prefix).strip()
++        if not normalized_prefix:
++            raise ValueError("native recapture request prefix must not be empty")
++        self.enabled = enabled
++        self.capacity = capacity
++        self.request_prefix = normalized_prefix
++        self.sequence = 0
++        self._receipts: deque[dict[str, Any]] = deque(maxlen=capacity)
++
++    @classmethod
++    def from_environment(cls) -> NativeRecaptureScopeObserver:
++        raw_enabled = os.environ.get("QBI_NATIVE_RECAPTURE_OBSERVER", "0")
++        normalized_enabled = raw_enabled.strip().lower()
++        false_values = {"0", "false", "no", "off"}
++        true_values = {"1", "true", "yes", "on"}
++        if normalized_enabled not in false_values | true_values:
++            raise ValueError("QBI_NATIVE_RECAPTURE_OBSERVER must be a boolean flag")
++        capacity_text = os.environ.get(
++            "QBI_NATIVE_RECAPTURE_OBSERVER_CAPACITY", "8192"
++        ).strip()
++        if not capacity_text.isdecimal():
++            raise ValueError(
++                "QBI_NATIVE_RECAPTURE_OBSERVER_CAPACITY must be an integer"
++            )
++        return cls(
++            enabled=normalized_enabled in true_values,
++            capacity=int(capacity_text),
++            request_prefix=os.environ.get(
++                "QBI_NATIVE_RECAPTURE_REQUEST_PREFIX",
++                "chatcmpl-anise-native-recapture-",
++            ),
++        )
++
++    def record(
++        self,
++        *,
++        num_scheduled_tokens: Mapping[str, int],
++        total_num_scheduled_tokens: int,
++        config_epoch: int,
++        max_num_running_reqs: int,
++        max_num_scheduled_tokens: int,
++    ) -> None:
++        if not self.enabled:
++            return
++        request_ids = sorted(str(request_id) for request_id in num_scheduled_tokens)
++        matched_request_ids = [
++            request_id
++            for request_id in request_ids
++            if request_id.startswith(self.request_prefix)
++        ]
++        if not matched_request_ids:
++            return
++        self.sequence += 1
++        self._receipts.append(
++            {
++                "schema": "qbi.native-recapture-scheduler-scope.v1",
++                "sequence": self.sequence,
++                "timestamp_ns": time.time_ns(),
++                "config_epoch": int(config_epoch),
++                "request_ids": request_ids,
++                "matched_request_ids": matched_request_ids,
++                "request_count": len(request_ids),
++                "matched_request_count": len(matched_request_ids),
++                "formed_batch": len(request_ids) > 1,
++                "num_scheduled_tokens": {
++                    request_id: int(num_scheduled_tokens[request_id])
++                    for request_id in request_ids
++                },
++                "total_num_scheduled_tokens": int(total_num_scheduled_tokens),
++                "max_num_running_reqs": int(max_num_running_reqs),
++                "max_num_scheduled_tokens": int(max_num_scheduled_tokens),
++            }
++        )
++
++    def state(self, after_sequence: int = 0) -> dict[str, Any]:
++        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
++            raise ValueError("native recapture sequence cursor must be an integer")
++        if after_sequence < 0:
++            raise ValueError("native recapture sequence cursor must be non-negative")
++        receipts = [
++            dict(receipt)
++            for receipt in self._receipts
++            if int(receipt["sequence"]) > after_sequence
++        ]
++        oldest = int(self._receipts[0]["sequence"]) if self._receipts else 0
++        return {
++            "schema": "qbi.native-recapture-scheduler-state.v1",
++            "observer_enabled": self.enabled,
++            "request_prefix": self.request_prefix,
++            "capacity": self.capacity,
++            "oldest_available_sequence": oldest,
++            "latest_sequence": self.sequence,
++            "receipts": receipts,
++        }
++
++
++__all__ = ["NativeRecaptureScopeObserver"]
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 692acda72..25c965e6e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -39,6 +39,9 @@ from vllm.v1.core.encoder_cache_manager import (
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
++from vllm.v1.core.sched.native_recapture_observer import (
++    NativeRecaptureScopeObserver,
++)
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+     GrammarOutput,
+@@ -117,6 +120,9 @@ class Scheduler(SchedulerInterface):
+             dict[str, int | dict[str, int]] | None
+         ) = None
+         self._pending_epoch_requests: list[Request] = []
++        self._native_recapture_scope_observer = (
++            NativeRecaptureScopeObserver.from_environment()
++        )
+         self.max_model_len = vllm_config.model_config.max_model_len
+         self.enable_kv_cache_events = (
+             self.kv_events_config is not None
+@@ -960,8 +966,27 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        self._record_native_recapture_scope(scheduler_output)
+         return scheduler_output
+ 
++    def _record_native_recapture_scope(self, scheduler_output: SchedulerOutput) -> None:
++        """Record a bounded, prompt-free scheduler receipt for formal recapture."""
++
++        self._native_recapture_scope_observer.record(
++            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
++            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
++            config_epoch=self._runtime_config_epoch,
++            max_num_running_reqs=self.max_num_running_reqs,
++            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
++        )
++
++    def get_native_recapture_scope_state(
++        self, after_sequence: int = 0
++    ) -> dict[str, Any]:
++        """Return immutable copies of observed scheduler steps after a cursor."""
++
++        return self._native_recapture_scope_observer.state(after_sequence)
++
+     def _build_kv_connector_meta(
+         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index b635ea42f..0cad3f298 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -328,6 +328,18 @@ class EngineCore:
+             "scheduler_limits": limits,
+         }
+ 
++    def get_native_recapture_scope_state(
++        self, after_sequence: int = 0
++    ) -> dict[str, Any]:
++        """Join scheduler scope receipts to the live EngineCore identity."""
++
++        state = self.scheduler.get_native_recapture_scope_state(after_sequence)
++        return {
++            **state,
++            "engine_boot_id": self._runtime_control_boot_id,
++            "scheduler_limits": self.scheduler.get_runtime_scheduler_limits(),
++        }
++
+     def prepare_runtime_transition(
+         self, mechanism_name: str, config: dict[str, Any]
+     ) -> dict[str, Any]:
+-- 
+2.53.0.windows.3
+
